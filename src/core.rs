@@ -34,7 +34,7 @@ pub struct OptimaCore {
     ekf: Arc<Mutex<EKFStorage>>,
     verifier: Arc<Mutex<Verifier>>,
     gpu_monitor: Arc<Mutex<GPUMonitor>>,
-    llm_client: Arc<Mutex<LLMClient>>,
+    llm_client: Arc<LLMClient>,
     
     request_count: u64,
     total_compression: f64,
@@ -45,17 +45,17 @@ pub struct OptimaCore {
 
 impl OptimaCore {
     pub async fn new(ekf_path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let hhtc_engine = HHTCEngine::new(16, 1000).await?; 
-        let ekf_storage = EKFStorage::new(ekf_path, hhtc_engine.get_tokenizer_arc()).await?;
+        let hhtc_engine = HHTCEngine::new(16, 1000).await?;
+        let ekf_storage = EKFStorage::new(ekf_path).await?;
         let gpu_monitor = GPUMonitor::new().await?;
         let llm_client = LLMClient::new().await?;
-        
+
         Ok(Self {
             hhtc: Arc::new(Mutex::new(hhtc_engine)),
             ekf: Arc::new(Mutex::new(ekf_storage)),
             verifier: Arc::new(Mutex::new(Verifier::new())),
             gpu_monitor: Arc::new(Mutex::new(gpu_monitor)),
-            llm_client: Arc::new(Mutex::new(llm_client)),
+            llm_client: Arc::new(llm_client),
             request_count: 0,
             total_compression: 0.0,
             reflections_trimmed: 0,
@@ -65,21 +65,19 @@ impl OptimaCore {
     }
 
     pub async fn process_request(&mut self, prompt: &str) -> Result<ProcessedResponse, Box<dyn std::error::Error>> {
-        let trimmed_prompt = {
-            if ffi::detect_reflection_loop(prompt).await {
-                self.reflections_trimmed += 1;
-                info!("Reflection loop detected. Trimming prompt...");
-                let verifier = self.verifier.lock().await;
-                verifier.trim_reflection(prompt)
-            } else {
-                prompt.to_string()
-            }
+        let reflection_detected = ffi::detect_reflection_loop(prompt).await;
+        let trimmed_prompt = if reflection_detected {
+            self.reflections_trimmed += 1;
+            info!("Reflection loop detected. Trimming prompt...");
+            let verifier = self.verifier.lock().await;
+            verifier.trim_reflection(prompt)
+        } else {
+            prompt.to_string()
         };
 
-        let (gpu_utilization, vram_bandwidth) = {
-            let monitor = self.gpu_monitor.lock().await;
-            (monitor.get_utilization().await, monitor.get_memory_bandwidth().await)
-        };
+        let mut monitor = self.gpu_monitor.lock().await;
+        let gpu_utilization = monitor.get_utilization().await;
+        let vram_bandwidth = monitor.get_memory_bandwidth().await;
         info!("GPU Utilization: {:.2}%, VRAM Bandwidth: {:.2} GB/s", gpu_utilization, vram_bandwidth);
         
         let (compressed_prompt, compression_ratio) = {
@@ -95,7 +93,7 @@ impl OptimaCore {
         info!("EKF query returned {} knowledge snippets.", ekf_knowledge.len());
         
         let llm_output = {
-            let mut llm = self.llm_client.lock().await;
+            let llm = self.llm_client.clone();
             llm.generate(&compressed_prompt, &ekf_knowledge).await?
         };
         
@@ -114,7 +112,7 @@ impl OptimaCore {
         Ok(ProcessedResponse {
             output: final_output,
             compression_ratio,
-            reflection_trimmed: ffi::detect_reflection_loop(prompt).await,
+            reflection_trimmed: reflection_detected,
             ekf_knowledge,
             bandwidth_saved,
             gpu_utilization,
